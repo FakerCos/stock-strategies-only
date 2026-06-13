@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from .config import MIN_PRICE_ROWS
+from . import datasources as ds
+from .cache import fetch_finmind_cached, FinMindRateLimitError
 
 
 @dataclass
@@ -103,3 +105,76 @@ def build_context_from_bundle(
         market_cap=capital.get("market_cap"),
         meta=meta,
     )
+
+
+def get_price_history_cached(stock_id: str, start: str, as_of: str | None = None) -> pd.DataFrame:
+    """走快取的個股日 K（取代 data.get_price_history 在 context 內的用途）。"""
+    df = fetch_finmind_cached("TaiwanStockPrice", stock_id, start, end_date=as_of)
+    if df.empty:
+        return df
+    df = df.rename(columns={"max": "high", "min": "low", "Trading_Volume": "volume"})
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    keep = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
+    return df[keep].sort_values("date").reset_index(drop=True)
+
+
+def _get_fundamentals_raw(stock_id: str) -> dict:
+    """年度 EPS/ROE 原始值（不切發布日，由 from_bundle 切）。"""
+    try:
+        df = fetch_finmind_cached("TaiwanStockFinancialStatements", stock_id, "2015-01-01")
+    except FinMindRateLimitError:
+        return {"eps": {}, "roe": {}}
+    if df.empty or not all(c in df.columns for c in ["date", "type", "value"]):
+        return {"eps": {}, "roe": {}}
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["year"] = df["date"].dt.year
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    eps = df[df["type"] == "EPS"].groupby("year")["value"].sum().to_dict()
+    roe = df[df["type"] == "ROE"].groupby("year")["value"].sum().to_dict()
+    return {"eps": {int(y): round(float(v), 2) for y, v in eps.items()},
+            "roe": {int(y): round(float(v), 2) for y, v in roe.items()}}
+
+
+def _gather_raw_bundle(stock_id: str, start: str, lookback_years: int) -> dict:
+    """一次抓全期資料（回測前置）。不切 as_of；切片交給 from_bundle。"""
+    return {
+        "price": get_price_history_cached(stock_id, start),
+        "index": ds.get_index_history("TAIEX", start),
+        "inst": ds.get_institutional(stock_id, start),
+        "revenue": ds.get_month_revenue(stock_id, start),
+        "valuation": ds.get_valuation(stock_id, start),
+        "margin": ds.get_margin(stock_id, start),
+        "shareholding": ds.get_shareholding(stock_id, start),
+        "fundamentals_raw": _get_fundamentals_raw(stock_id),
+        "capital": ds.get_capital_and_industry(stock_id),
+    }
+
+
+def build_context(
+    stock_id: str,
+    as_of_date: str,
+    *,
+    lookback_years: int = 5,
+    info_df: pd.DataFrame | None = None,
+    strict: bool = False,
+) -> FactorContext:
+    """runtime 單檔用：抓一次全期 → from_bundle 切到 as_of。
+    strict=True 時資料缺漏 raise；False(預設) 記 meta 回中性。"""
+    as_of = pd.Timestamp(as_of_date)
+    start = (as_of - pd.DateOffset(years=lookback_years) - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
+    try:
+        bundle = _gather_raw_bundle(stock_id, start, lookback_years)
+    except Exception:
+        if strict:
+            raise
+        bundle = {"price": pd.DataFrame(), "index": pd.DataFrame(), "inst": pd.DataFrame(),
+                  "revenue": pd.DataFrame(), "valuation": pd.DataFrame(), "margin": pd.DataFrame(),
+                  "shareholding": pd.DataFrame(), "fundamentals_raw": {"eps": {}, "roe": {}},
+                  "capital": {}}
+    ctx = build_context_from_bundle(stock_id, as_of, bundle)
+    if strict and ctx.meta.get("missing"):
+        raise RuntimeError(f"build_context strict: 缺資料 {ctx.meta['missing']}")
+    return ctx

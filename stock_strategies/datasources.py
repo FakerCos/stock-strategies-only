@@ -53,3 +53,33 @@ def get_institutional(stock_id: str, start: str, as_of: str | None = None) -> pd
             wide[col] = 0
     wide["total_net"] = wide["foreign_net"] + wide["trust_net"] + wide["dealer_net"]
     return wide[["date", "foreign_net", "trust_net", "dealer_net", "total_net"]].sort_values("date").reset_index(drop=True)
+
+
+def get_month_revenue(stock_id: str, start: str, as_of: str | None = None) -> pd.DataFrame:
+    """月營收（月）。回欄位:
+       avail_date(資料可得日≈次月10日), revenue_year, revenue_month, revenue, mom, yoy。
+    防 look-ahead：as_of 切片用 avail_date <= as_of（非所屬月）。"""
+    try:
+        # 月營收全抓（不在快取層用 as_of 切，因 avail_date 在此才算得出）
+        df = fetch_finmind_cached("TaiwanStockMonthRevenue", stock_id, start)
+    except FinMindRateLimitError:
+        return pd.DataFrame()
+    if df.empty or not _require_cols(df, ["revenue_year", "revenue_month", "revenue"]):
+        return pd.DataFrame()
+    df = df.copy()
+    for c in ["revenue_year", "revenue_month", "revenue"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["revenue_year", "revenue_month"])
+    df["period"] = pd.to_datetime(
+        df["revenue_year"].astype(int).astype(str) + "-"
+        + df["revenue_month"].astype(int).astype(str).str.zfill(2) + "-01"
+    )
+    # 公布日保守估：所屬月底 + 10 天（次月 10 日，法規上限）
+    df["avail_date"] = df["period"] + pd.offsets.MonthEnd(0) + pd.Timedelta(days=10)
+    df = df.sort_values("period").reset_index(drop=True)
+    df["mom"] = df["revenue"].pct_change()
+    df["yoy"] = df["revenue"].pct_change(periods=12)
+    if as_of:
+        df = df[df["avail_date"] <= pd.to_datetime(as_of)]
+    return df[["avail_date", "period", "revenue_year", "revenue_month",
+               "revenue", "mom", "yoy"]].reset_index(drop=True)
